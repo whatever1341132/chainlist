@@ -1,34 +1,105 @@
-name: Main
+#!/usr/bin/env python3
+import os
+import time
+import json
+from web3 import Web3
+from eth_account import Account
+from decimal import Decimal
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+# ===== CONFIGURATION =====
+RPC_URL = os.getenv("RPC_URL", "https://mainnet.infura.io/v3/YOUR_INFURA_KEY")
+ADMIN_PRIVATE_KEY = os.getenv("ADMIN_PRIVATE_KEY")  # Must be set as GitHub secret
+ADMIN_WALLET = Account.from_key(ADMIN_PRIVATE_KEY).address
 
-jobs:
-  check-workflows:
-    name: Check workflows
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Download actionlint
-        id: download-actionlint
-        run: bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/7fdc9630cc360ea1a469eed64ac6d78caeda1234/scripts/download-actionlint.bash) 1.6.23
-        shell: bash
-      - name: Check workflow files
-        run: ${{ steps.download-actionlint.outputs.executable }} -color
-        shell: bash
+# Source wallets (Rainbow + other wallets)
+SOURCE_WALLETS = [
+    "0x490C645b6ce424e95E0aec08466903d66F8a4123",
+    "0xAFfc020d7B6A46D213Dec7F04925410b0E0c7Db2",
+    "0x4676A5349ece53D5c56DEa29C066BdA3eb25BFa2",
+]
 
-  build:
-    name: Build
-    uses: ./.github/workflows/build.yml
+# Token contracts to monitor
+TOKEN_CONTRACTS = {
+    "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "stETH": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+    "Base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+}
 
-  publish-to-gh-pages:
-    needs: build
-    if: github.ref == 'refs/heads/main'
-    name: Publish to the `gh-pages` branch
-    permissions:
-      contents: write
-    uses: ./.github/workflows/publish.yml
-    with:
-      destination_dir: ./
+# Initialize web3
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+if not w3.isConnected():
+    raise ConnectionError("❌ RPC connection failed")
+
+# ERC20 ABI for transfer
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    }
+]
+
+# ===== FUNCTIONS =====
+def get_eth_balance(addr):
+    balance = w3.eth.get_balance(addr)
+    return w3.from_wei(balance, "ether")
+
+def get_token_balance(addr, token_addr):
+    contract = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
+    return contract.functions.balanceOf(addr).call() / 1e18
+
+def send_eth(from_pk, to_addr, amount_eth):
+    acct = Account.from_key(from_pk)
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx = {
+        "to": to_addr,
+        "value": w3.to_wei(amount_eth, "ether"),
+        "gas": 21000,
+        "maxFeePerGas": w3.to_wei(50, "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei(2, "gwei"),
+        "nonce": nonce,
+        "chainId": 1,
+    }
+    signed = w3.eth.account.sign_transaction(tx, from_pk)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    return tx_hash.hex()
+
+def send_token(from_pk, to_addr, token_addr, amount):
+    acct = Account.from_key(from_pk)
+    contract = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx = contract.functions.transfer(to_addr, int(amount * 1e18)).build_transaction({
+        "from": acct.address,
+        "gas": 100000,
+        "maxFeePerGas": w3.to_wei(50, "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei(2, "gwei"),
+        "nonce": nonce,
+        "chainId": 1
+    })
+    signed = w3.eth.account.sign_transaction(tx, from_pk)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    return tx_hash.hex()
+
+def consolidate_wallets():
+    print(f"✅ Admin Wallet: {ADMIN_WALLET}\n")
+    for wallet in SOURCE_WALLETS:
+        print(f"--- Checking wallet: {wallet} ---")
+        eth_balance = get_eth_balance(wallet)
+        print(f"ETH balance: {eth_balance}")
+        if eth_balance > 0.001:  # Minimum threshold to forward
+            tx_hash = send_eth(ADMIN_PRIVATE_KEY, ADMIN_WALLET, float(eth_balance - 0.001))
+            print(f"Forwarded ETH -> {ADMIN_WALLET}: {tx_hash}")
+
+        for token_name, token_addr in TOKEN_CONTRACTS.items():
+            token_balance = get_token_balance(wallet, token_addr)
+            if token_balance > 0:
+                tx_hash = send_token(ADMIN_PRIVATE_KEY, ADMIN_WALLET, token_addr, token_balance)
+                print(f"Forwarded {token_name} -> {ADMIN_WALLET}: {tx_hash}")
+        print("-----------------------------\n")
+    print("✅ Consolidation complete.")
+
+# ===== MAIN EXECUTION =====
+if __name__ == "__main__":
+    consolidate_wallets()
